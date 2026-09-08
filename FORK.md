@@ -51,10 +51,10 @@ python3 scripts/fork_sync.py --tag v0.9.0 --validate-always
 git -c push.followTags=false push origin HEAD:feature/local-path-click
 ```
 
-Only the personal synchronization workflow is enabled in this fork. Do not push
-upstream release tags or enable inherited deployment/release workflows. The fork
-uses the GitHub Actions token with repository contents permission; no upstream
-write permission or personal access token is required by the sync workflow.
+The personal synchronization workflow only pushes this feature branch and never
+pushes upstream release tags. Inherited workflows retain their existing settings.
+The sync workflow uses the GitHub Actions token with repository contents
+permission; no upstream write permission or personal access token is required.
 
 Official `herdr update` installs the upstream build and would replace this feature.
 Use this branch's build when the extension is needed.
