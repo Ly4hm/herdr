@@ -25,6 +25,15 @@ pub(crate) struct PopupPaneState {
     pub height: Option<crate::popup_size::PopupSize>,
 }
 
+/// Transient presentation cache computed only on Ctrl+mouse motion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalPathHover {
+    pub pane_id: PaneId,
+    pub area: Rect,
+    pub content_seq: u64,
+    pub cells: Vec<(u16, u16)>,
+}
+
 // ---------------------------------------------------------------------------
 // Selection autoscroll types
 // ---------------------------------------------------------------------------
@@ -1434,6 +1443,7 @@ pub struct AppState {
         std::collections::HashMap<crate::app::InputSourceId, WorkspacePressState>,
     pub(crate) tab_presses: std::collections::HashMap<crate::app::InputSourceId, TabPressState>,
     pub selection: Option<Selection>,
+    pub(crate) local_path_hover: Option<LocalPathHover>,
     pub selection_autoscroll: Option<SelectionAutoscroll>,
     pub context_menu: Option<ContextMenuState>,
     // Notifications
@@ -1831,6 +1841,7 @@ impl AppState {
             workspace_presses: std::collections::HashMap::new(),
             tab_presses: std::collections::HashMap::new(),
             selection: None,
+            local_path_hover: None,
             selection_autoscroll: None,
             context_menu: None,
             update_available: None,

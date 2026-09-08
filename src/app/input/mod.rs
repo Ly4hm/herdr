@@ -79,6 +79,7 @@ impl App {
         &mut self,
         key: TerminalKey,
     ) -> Option<super::TerminalInputTarget> {
+        self.state.local_path_hover = None;
         if self.state.popup_pane.is_some() {
             return self.handle_terminal_key(key).await;
         }
@@ -335,6 +336,45 @@ impl App {
         source_id: super::InputSourceId,
         mouse: MouseEvent,
     ) {
+        if mouse.kind == MouseEventKind::Moved
+            && mouse.modifiers.contains(KeyModifiers::CONTROL)
+            && self.state.mode == Mode::Terminal
+            && self.state.popup_pane.is_none()
+        {
+            let hover = self
+                .state
+                .pane_at(mouse.column, mouse.row)
+                .and_then(|info| {
+                    if let Some(cached) = self.state.local_path_hover.as_ref() {
+                        if cached.pane_id == info.id
+                            && cached.area == info.inner_rect
+                            && cached.cells.contains(&(mouse.column, mouse.row))
+                            && self
+                                .state
+                                .active
+                                .and_then(|idx| {
+                                    self.state.runtime_for_pane_in_workspace(
+                                        &self.terminal_runtimes,
+                                        idx,
+                                        info.id,
+                                    )
+                                })
+                                .is_some_and(|rt| rt.content_seq() == cached.content_seq)
+                        {
+                            return Some(cached.clone());
+                        }
+                    }
+                    self.state.local_path_hover_at_pane_cell(
+                        &self.terminal_runtimes,
+                        info.id,
+                        mouse.row.saturating_sub(info.inner_rect.y),
+                        mouse.column.saturating_sub(info.inner_rect.x),
+                    )
+                });
+            self.state.local_path_hover = hover;
+        } else {
+            self.state.local_path_hover = None;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.pending_url_click_sources.remove(&source_id);
@@ -592,7 +632,32 @@ impl App {
             self.state
                 .url_at_pane_cell(&self.terminal_runtimes, info.id, viewport_row, col)
         else {
-            return false;
+            return self.handle_modified_local_path_click_with(
+                source_id,
+                info.id,
+                viewport_row,
+                col,
+                |raw, cwd| {
+                    // Resolve and inspect files only after a click, outside the event/render loop.
+                    tokio::task::spawn_blocking(move || {
+                        let path = match crate::platform::resolve_local_path(&raw, &cwd) {
+                            Ok(path) => path,
+                            Err(err) => {
+                                tracing::warn!(%err, path = %raw, cwd = %cwd.display(), "could not resolve clicked local path");
+                                return;
+                            }
+                        };
+                        tracing::info!(path = %path.display(), "revealing clicked local path");
+                        match crate::platform::reveal_local_path(&path) {
+                            Ok(Some(mut child)) => {
+                                let _ = child.wait();
+                            }
+                            Ok(None) => {}
+                            Err(err) => tracing::warn!(%err, path = %path.display(), "could not reveal clicked local path"),
+                        }
+                    });
+                },
+            );
         };
 
         self.last_pane_click = None;
@@ -611,6 +676,40 @@ impl App {
                 tracing::warn!(err = %err, url = %url, "failed to open pane URL");
             }
         }
+        true
+    }
+
+    fn handle_modified_local_path_click_with(
+        &mut self,
+        source_id: super::InputSourceId,
+        pane_id: crate::layout::PaneId,
+        viewport_row: u16,
+        col: u16,
+        reveal: impl FnOnce(String, std::path::PathBuf),
+    ) -> bool {
+        let Some(raw) =
+            self.state
+                .local_path_at_pane_cell(&self.terminal_runtimes, pane_id, viewport_row, col)
+        else {
+            return false;
+        };
+        let Some(cwd) = self
+            .state
+            .active
+            .and_then(|idx| self.state.workspaces.get(idx))
+            .and_then(|ws| ws.active_tab())
+            .and_then(|tab| {
+                tab.foreground_cwd_for_pane(pane_id, &self.terminal_runtimes)
+                    .or_else(|| {
+                        tab.cwd_for_pane(pane_id, &self.state.terminals, &self.terminal_runtimes)
+                    })
+            })
+        else {
+            return false;
+        };
+        self.last_pane_click = None;
+        self.pending_url_click_sources.insert(source_id);
+        reveal(raw, cwd);
         true
     }
 

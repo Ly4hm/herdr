@@ -406,10 +406,41 @@ pub(super) fn render_panes(
                 true,
             );
             render_copy_mode_cursor(app, frame, info);
+            render_local_path_hover(app, frame.buffer_mut(), info, || rt.content_seq());
         }
     }
 
     render_pane_borders(app, ws, pane_infos, split_borders, frame);
+}
+
+fn render_local_path_hover(
+    app: &AppState,
+    buffer: &mut ratatui::buffer::Buffer,
+    info: &PaneInfo,
+    content_seq: impl FnOnce() -> u64,
+) {
+    if app.mode != Mode::Terminal {
+        return;
+    }
+    let Some(hover) = app.local_path_hover.as_ref() else {
+        return;
+    };
+    // Query only the hovered pane, after geometry matches. No terminal reads
+    // are added to rendering for the normal, non-hovered case.
+    if hover.pane_id != info.id
+        || hover.area != info.inner_rect
+        || hover.content_seq != content_seq()
+    {
+        return;
+    }
+    for &(x, y) in &hover.cells {
+        if !info.inner_rect.contains((x, y).into()) {
+            continue;
+        }
+        if let Some(cell) = buffer.cell_mut((x, y)) {
+            cell.set_style(cell.style().add_modifier(Modifier::UNDERLINED));
+        }
+    }
 }
 
 pub(crate) fn popup_pane_rects(app: &AppState, area: Rect) -> Option<(Rect, Rect)> {
@@ -1008,6 +1039,185 @@ mod tests {
     use crate::terminal::TerminalRuntime;
     use crate::terminal::TerminalState;
     use crate::workspace::Workspace;
+
+    #[test]
+    fn local_path_hover_underlines_only_path_cells_and_preserves_style() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        let pane_id = PaneId::alloc();
+        let info = PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 8, 4),
+            inner_rect: Rect::new(1, 1, 6, 2),
+            scrollbar_rect: None,
+            borders: Borders::ALL,
+            is_focused: true,
+        };
+        app.local_path_hover = Some(crate::app::state::LocalPathHover {
+            pane_id,
+            area: info.inner_rect,
+            content_seq: 7,
+            // Last three cells exercise pane and buffer clipping independently.
+            cells: vec![(2, 1), (3, 1), (0, 1), (6, 1), (2, 2)],
+        });
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 6, 2));
+        let style = Style::default()
+            .fg(Color::Green)
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD | Modifier::ITALIC);
+        buffer[(2, 1)].set_symbol("文").set_style(style);
+        buffer[(3, 1)].set_style(style);
+        let before = buffer.clone();
+
+        render_local_path_hover(&app, &mut buffer, &info, || 7);
+
+        for y in 0..2 {
+            for x in 0..6 {
+                let cell = &buffer[(x, y)];
+                let expected = &before[(x, y)];
+                assert_eq!(cell.symbol(), expected.symbol());
+                if [(2, 1), (3, 1)].contains(&(x, y)) {
+                    assert_eq!(
+                        cell.style(),
+                        expected.style().add_modifier(Modifier::UNDERLINED)
+                    );
+                } else {
+                    assert_eq!(cell, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn local_path_hover_skips_inactive_stale_and_unrelated_panes() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        let pane_id = PaneId::alloc();
+        let info = PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 6, 2),
+            inner_rect: Rect::new(0, 0, 6, 2),
+            scrollbar_rect: None,
+            borders: Borders::NONE,
+            is_focused: true,
+        };
+        let mut buffer = ratatui::buffer::Buffer::empty(info.rect);
+        let before = buffer.clone();
+        render_local_path_hover(&app, &mut buffer, &info, || {
+            panic!("no hover must not query terminal")
+        });
+
+        app.local_path_hover = Some(crate::app::state::LocalPathHover {
+            pane_id,
+            area: info.inner_rect,
+            content_seq: 7,
+            cells: vec![(2, 1)],
+        });
+        render_local_path_hover(&app, &mut buffer, &info, || 8);
+        app.mode = Mode::Copy;
+        render_local_path_hover(&app, &mut buffer, &info, || {
+            panic!("copy mode must not query terminal")
+        });
+        app.mode = Mode::Terminal;
+
+        let mut other_pane = info.clone();
+        other_pane.id = PaneId::alloc();
+        render_local_path_hover(&app, &mut buffer, &other_pane, || {
+            panic!("other pane must not query terminal")
+        });
+        let mut resized_pane = info.clone();
+        resized_pane.inner_rect.width -= 1;
+        render_local_path_hover(&app, &mut buffer, &resized_pane, || {
+            panic!("changed geometry must not query terminal")
+        });
+        assert_eq!(buffer, before);
+    }
+
+    #[test]
+    #[ignore = "manual hover render scaling profile; reports timings without a wall-clock threshold"]
+    fn local_path_hover_render_scale_profile() {
+        use std::cell::Cell;
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        const ITERATIONS: u32 = 100_000;
+        let screen = Rect::new(0, 0, 120, 40);
+        for pane_count in [1, 15] {
+            let mut app = AppState::test_new();
+            app.mode = Mode::Terminal;
+            let columns = if pane_count == 1 { 1 } else { 3 };
+            let rows = if pane_count == 1 { 1 } else { 5 };
+            let pane_width = screen.width / columns;
+            let pane_height = screen.height / rows;
+            let panes: Vec<_> = (0..pane_count)
+                .map(|index| {
+                    let area = Rect::new(
+                        (index % columns) * pane_width,
+                        (index / columns) * pane_height,
+                        pane_width,
+                        pane_height,
+                    );
+                    PaneInfo {
+                        id: PaneId::alloc(),
+                        rect: area,
+                        inner_rect: area,
+                        scrollbar_rect: None,
+                        borders: Borders::NONE,
+                        is_focused: index == 0,
+                    }
+                })
+                .collect();
+            let mut buffer = ratatui::buffer::Buffer::empty(screen);
+            let mut medians = [Duration::ZERO; 2];
+            for (case, hover_active) in [false, true].into_iter().enumerate() {
+                let hovered_pane = &panes[panes.len() / 2];
+                app.local_path_hover = hover_active.then(|| crate::app::state::LocalPathHover {
+                    pane_id: hovered_pane.id,
+                    area: hovered_pane.inner_rect,
+                    content_seq: 7,
+                    cells: (0..12)
+                        .map(|column| {
+                            (
+                                hovered_pane.inner_rect.x + column,
+                                hovered_pane.inner_rect.y,
+                            )
+                        })
+                        .collect(),
+                });
+                let mut samples = [Duration::ZERO; 3];
+                for sample in &mut samples {
+                    let queries = Cell::new(0u32);
+                    let start = Instant::now();
+                    for _ in 0..ITERATIONS {
+                        for info in &panes {
+                            render_local_path_hover(
+                                black_box(&app),
+                                black_box(&mut buffer),
+                                black_box(info),
+                                || {
+                                    queries.set(queries.get() + 1);
+                                    black_box(7)
+                                },
+                            );
+                        }
+                    }
+                    *sample = start.elapsed();
+                    assert_eq!(queries.get(), if hover_active { ITERATIONS } else { 0 });
+                    black_box(&buffer);
+                }
+                samples.sort();
+                medians[case] = samples[1];
+            }
+            let none_ns = medians[0].as_nanos() as f64 / f64::from(ITERATIONS);
+            let hover_ns = medians[1].as_nanos() as f64 / f64::from(ITERATIONS);
+            eprintln!(
+                "local_path_hover_render_scale_profile: panes={pane_count}, geometry=120x40, \
+                 none={none_ns:.1} ns/frame, one_hover={hover_ns:.1} ns/frame, \
+                 delta={:.1} ns/frame, content_seq_queries/frame=0 vs 1",
+                hover_ns - none_ns,
+            );
+        }
+    }
 
     fn render_view_pane_borders(app: &AppState, ws: &Workspace, frame: &mut Frame) {
         render_pane_borders(

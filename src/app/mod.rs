@@ -609,6 +609,7 @@ impl App {
             workspace_presses: HashMap::new(),
             tab_presses: HashMap::new(),
             selection: None,
+            local_path_hover: None,
             selection_autoscroll: None,
             context_menu: None,
             update_available,
@@ -1769,6 +1770,10 @@ impl App {
         apply_host_terminal_theme: bool,
     ) {
         for event in events {
+            if !matches!(event, crate::raw_input::RawInputEvent::Mouse(_)) {
+                self.state.local_path_hover = None;
+            }
+
             let previous_mode = self.state.mode;
             match event {
                 crate::raw_input::RawInputEvent::Key(key) => {

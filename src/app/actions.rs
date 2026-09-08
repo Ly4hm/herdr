@@ -2248,6 +2248,142 @@ impl AppState {
             return safe_web_url(&uri).map(str::to_owned);
         }
 
+        let (line, logical_col) =
+            self.text_at_pane_cell(terminal_runtimes, pane_id, viewport_row, col)?;
+        url_at_column(&line, logical_col).map(str::to_owned)
+    }
+
+    pub(crate) fn local_path_at_pane_cell(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+        viewport_row: u16,
+        col: u16,
+    ) -> Option<String> {
+        let ws_idx = self.active?;
+        let info = self.pane_info_by_id(pane_id)?;
+        if viewport_row >= info.inner_rect.height || col >= info.inner_rect.width {
+            return None;
+        }
+        let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
+        let screen_col = info.inner_rect.x.saturating_add(col);
+        let screen_row = info.inner_rect.y.saturating_add(viewport_row);
+        if let Some((_, _, uri)) = rt
+            .visible_hyperlinks(info.inner_rect)
+            .into_iter()
+            .find(|((x, y), _, _)| *x == screen_col && *y == screen_row)
+        {
+            return crate::local_path::path_from_file_uri(&uri);
+        }
+        let (line, logical_col) =
+            self.text_at_pane_cell(terminal_runtimes, pane_id, viewport_row, col)?;
+        crate::local_path::path_at_column(&line, logical_col)
+    }
+
+    pub(crate) fn local_path_hover_at_pane_cell(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+        viewport_row: u16,
+        col: u16,
+    ) -> Option<super::state::LocalPathHover> {
+        let info = self.pane_info_by_id(pane_id)?;
+        let area = info.inner_rect;
+        if viewport_row >= area.height || col >= area.width {
+            return None;
+        }
+        let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, self.active?, pane_id)?;
+        let content_seq = rt.content_seq();
+        if !content_seq.is_multiple_of(2) {
+            return None;
+        }
+        let links = rt.visible_hyperlinks(area);
+        let target = (area.x + col, area.y + viewport_row);
+        let cells = if let Some(index) = links
+            .iter()
+            .position(|(position, _, _)| *position == target)
+        {
+            let uri = &links[index].2;
+            crate::local_path::path_from_file_uri(uri)?;
+            let linear = |i: usize| {
+                u32::from(links[i].0 .1 - area.y) * u32::from(area.width)
+                    + u32::from(links[i].0 .0 - area.x)
+            };
+            let mut first = index;
+            let mut last = index;
+            while first > 0 && links[first - 1].2 == *uri && linear(first - 1) + 1 == linear(first)
+            {
+                first -= 1;
+            }
+            while last + 1 < links.len()
+                && links[last + 1].2 == *uri
+                && linear(last) + 1 == linear(last + 1)
+            {
+                last += 1;
+            }
+            links[first..=last].iter().map(|item| item.0).collect()
+        } else {
+            let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
+            let selection = Selection::line_range(
+                pane_id,
+                Selection::absolute_row_for_viewport(0, metrics),
+                Selection::absolute_row_for_viewport(area.height.saturating_sub(1), metrics),
+                area.width.saturating_sub(1),
+            );
+            let text = rt.extract_selection(&selection)?;
+            let mapped = visible_text_cells(&text, area.width);
+            let cell = mapped.iter().find(|cell| {
+                let width = u16::from(crate::ghostty::unicode_codepoint_width(cell.ch as u32));
+                cell.screen_row == viewport_row
+                    && col >= cell.screen_col
+                    && col < cell.screen_col.saturating_add(width)
+            })?;
+            let start = text[..cell.byte_index].rfind('\n').map_or(0, |i| i + 1);
+            let end = text[cell.byte_index..]
+                .find('\n')
+                .map_or(text.len(), |i| cell.byte_index + i);
+            let found =
+                crate::local_path::path_match_at_column(&text[start..end], cell.logical_col)?;
+            let range = start + found.byte_range.start..start + found.byte_range.end;
+            let mut cells = Vec::new();
+            for item in mapped
+                .iter()
+                .filter(|item| range.contains(&item.byte_index))
+            {
+                let width = u16::from(crate::ghostty::unicode_codepoint_width(item.ch as u32));
+                for offset in 0..width {
+                    let x = item.screen_col.saturating_add(offset);
+                    if x < area.width && item.screen_row < area.height {
+                        cells.push((area.x + x, area.y + item.screen_row));
+                    }
+                }
+            }
+            cells
+        };
+        if cells.is_empty() || rt.content_seq() != content_seq {
+            return None;
+        }
+        Some(super::state::LocalPathHover {
+            pane_id,
+            area,
+            content_seq,
+            cells,
+        })
+    }
+
+    fn text_at_pane_cell(
+        &self,
+        terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry,
+        pane_id: crate::layout::PaneId,
+        viewport_row: u16,
+        col: u16,
+    ) -> Option<(String, u16)> {
+        let ws_idx = self.active?;
+        let info = self.pane_info_by_id(pane_id)?;
+        if viewport_row >= info.inner_rect.height || col >= info.inner_rect.width {
+            return None;
+        }
+        let rt = self.runtime_for_pane_in_workspace(terminal_runtimes, ws_idx, pane_id)?;
         let metrics = self.pane_scroll_metrics(terminal_runtimes, pane_id);
         let visible_selection = Selection::line_range(
             pane_id,
@@ -2265,7 +2401,7 @@ impl AppState {
             .find('\n')
             .map_or(visible_text.len(), |idx| logical_cell.byte_index + idx);
         let line = visible_text.get(line_start..line_end)?;
-        url_at_column(line, logical_cell.logical_col).map(str::to_owned)
+        Some((line.to_owned(), logical_cell.logical_col))
     }
 
     pub fn copy_selection(&mut self, terminal_runtimes: &crate::terminal::TerminalRuntimeRegistry) {

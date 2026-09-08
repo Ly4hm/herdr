@@ -2923,6 +2923,7 @@ impl HeadlessServer {
         );
         let render_neutral_mouse_motion =
             events_are_render_neutral_mouse_motion(&events, self.app.state.mode);
+        let previous_local_path_hover = self.app.state.local_path_hover.clone();
         if let Some(client) = self.clients.get_mut(&client_id) {
             if host_surface_redraw {
                 client.request_repaint();
@@ -2959,6 +2960,12 @@ impl HeadlessServer {
         // Client-local theme reports were applied above; routing them again would update every
         // pane once per palette entry instead of once per captured batch.
         self.app.route_client_events_from(client_id, events, false);
+        let local_path_hover_changed = previous_local_path_hover != self.app.state.local_path_hover;
+        if local_path_hover_changed && render_neutral_mouse_motion {
+            if let Some(client) = self.clients.get_mut(&client_id) {
+                client.request_semantic_redraw_after_input();
+            }
+        }
         if self.app.take_config_reloaded_from_disk() {
             self.reload_server_config(false);
         } else {
@@ -2983,7 +2990,10 @@ impl HeadlessServer {
 
             false
         } else {
-            foreground_changed || theme_changed || (interaction && !render_neutral_mouse_motion)
+            foreground_changed
+                || theme_changed
+                || local_path_hover_changed
+                || (interaction && !render_neutral_mouse_motion)
         }
     }
 
@@ -4907,6 +4917,8 @@ impl HeadlessServer {
 
 // Pane applications render their own motion responses through PTY output. Only Herdr modes with
 // hover selection mutate the current frame directly from a plain mouse-move event.
+// Terminal local-path hover is checked after dispatch so unchanged motion keeps
+// this optimization, including Control-motion over text without a local path.
 fn events_are_render_neutral_mouse_motion(
     events: &[crate::raw_input::RawInputEvent],
     mode: crate::app::Mode,
@@ -8659,6 +8671,58 @@ next_tab = ""
         assert!(server.handle_server_event(motion()));
         assert_eq!(server.foreground_client_id, Some(2));
         assert!(!server.handle_server_event(motion()));
+    }
+
+    #[tokio::test]
+    async fn local_path_hover_renders_only_changes_for_raw_and_typed_mouse_motion() {
+        for typed in [false, true] {
+            let mut server = test_headless_server();
+            let _input_rx = install_focused_test_runtime(&mut server, b"./output/report.csv");
+            server.clients.insert(1, test_app_client(Some(true), 1));
+            server.foreground_client_id = Some(1);
+            server.sync_foreground_client_state();
+            server.resize_shared_runtime_to_effective_size();
+            let pane = server.app.state.view.pane_infos[0].clone();
+            let column = pane.inner_rect.x + 4;
+            let row = pane.inner_rect.y;
+            let motion = |row: u16, control: bool| {
+                if typed {
+                    ServerEvent::ClientInputEvents {
+                        client_id: 1,
+                        events: vec![crate::protocol::ClientInputEvent::Mouse {
+                            kind: crate::protocol::ClientMouseKind::Moved,
+                            column,
+                            row,
+                            modifiers: if control {
+                                KeyModifiers::CONTROL.bits()
+                            } else {
+                                0
+                            },
+                        }],
+                    }
+                } else {
+                    let button = if control { 51 } else { 35 };
+                    ServerEvent::ClientInput {
+                        client_id: 1,
+                        data: format!("\x1b[<{button};{};{}M", column + 1, row + 1).into_bytes(),
+                    }
+                }
+            };
+
+            assert!(!server.handle_server_event(motion(row + 2, true)));
+            assert!(server.app.state.local_path_hover.is_none());
+            assert!(server.handle_server_event(motion(row, true)));
+            assert!(server.app.state.local_path_hover.is_some());
+            assert!(!server.handle_server_event(motion(row, true)));
+            assert!(server.handle_server_event(motion(row + 2, true)));
+            assert!(server.app.state.local_path_hover.is_none());
+            assert!(!server.handle_server_event(motion(row + 2, true)));
+
+            assert!(server.handle_server_event(motion(row, true)));
+            assert!(server.handle_server_event(motion(row, false)));
+            assert!(server.app.state.local_path_hover.is_none());
+            assert!(!server.handle_server_event(motion(row, false)));
+        }
     }
 
     #[test]

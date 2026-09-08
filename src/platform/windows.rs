@@ -1912,6 +1912,22 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     }
 }
 
+pub fn reveal_local_path(path: &std::path::Path) -> std::io::Result<Option<std::process::Child>> {
+    let metadata = path.metadata()?;
+    let mut command = std::process::Command::new("explorer.exe");
+    command.arg(super::explorer_reveal_argument(
+        path.as_os_str(),
+        metadata.is_dir(),
+    ));
+    super::configure_background_command(&mut command);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(Some)
+}
+
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     for attempt in 0..10 {
         if unsafe { OpenClipboard(null_mut()) } != 0 {

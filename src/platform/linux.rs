@@ -476,6 +476,137 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
         .map(Some)
 }
 
+/// Reveal a local file or open a directory. Call off the UI thread: WSL path
+/// translation waits for a short-lived `wslpath` process.
+pub fn reveal_local_path(path: &std::path::Path) -> std::io::Result<Option<std::process::Child>> {
+    let path = path.canonicalize()?;
+    let is_dir = path.is_dir();
+    if running_inside_wsl() {
+        let output = Command::new("wslpath")
+            .arg("-w")
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "wslpath failed to translate the local path",
+            ));
+        }
+        let windows_path = parse_wslpath_output(&output.stdout)?;
+        let argument = super::explorer_reveal_argument(windows_path.as_ref(), is_dir);
+        let spawn = |program: &str| {
+            Command::new(program)
+                .arg(&argument)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+        };
+        let mut explorer = match spawn("explorer.exe") {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                spawn("/mnt/c/Windows/explorer.exe")
+            }
+            result => result,
+        }?;
+        let _ = explorer.wait();
+        activate_wsl_explorer(windows_path, is_dir)?;
+        return Ok(None);
+    }
+    let directory = if is_dir {
+        path.as_path()
+    } else {
+        path.parent()
+            .ok_or_else(|| std::io::Error::other("path has no parent directory"))?
+    };
+    Command::new("xdg-open")
+        .arg(directory)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Some)
+}
+
+/// Runs only in the click worker, never in input handling or rendering.
+fn activate_wsl_explorer(windows_path: &str, is_dir: bool) -> std::io::Result<()> {
+    use base64::Engine;
+    let base64 = base64::engine::general_purpose::STANDARD;
+    // Encode path data separately so PowerShell never interprets filename characters.
+    let script = format!(
+        "$env:HERDR_REVEAL_PATH = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}'));\n$env:HERDR_REVEAL_IS_DIR = '{}';\n{}",
+        base64.encode(windows_path.as_bytes()),
+        if is_dir { "1" } else { "0" },
+        include_str!("reveal_in_explorer.ps1"),
+    );
+    let encoded = base64.encode(
+        script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>(),
+    );
+    let launch = |program: &str| {
+        Command::new(program)
+            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded])
+            .stdin(Stdio::null())
+            .output()
+    };
+    let output = match launch("powershell.exe") {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            launch("/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+        }
+        result => result,
+    }?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "Explorer opened but foreground activation failed: {} {}",
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )));
+    }
+    tracing::info!(result = %String::from_utf8_lossy(&output.stdout).trim(), "activated Explorer window");
+    Ok(())
+}
+
+fn parse_wslpath_output(output: &[u8]) -> std::io::Result<&str> {
+    let text = std::str::from_utf8(output)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    // Remove the command's line ending, preserving spaces in the filename.
+    let path = text.strip_suffix('\n').unwrap_or(text);
+    let path = path.strip_suffix('\r').unwrap_or(path);
+    if path.is_empty() || path.contains(['\0', '\n', '\r']) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid wslpath output",
+        ));
+    }
+    Ok(path)
+}
+
+pub(super) fn local_path_from_text_platform(raw: &str) -> std::io::Result<PathBuf> {
+    let bytes = raw.as_bytes();
+    let windows_path = (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+        || raw.starts_with("\\\\");
+    if windows_path && running_inside_wsl() {
+        let output = Command::new("wslpath")
+            .arg("-u")
+            .arg(raw)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Err(std::io::Error::other(
+                "wslpath failed to translate the Windows path",
+            ));
+        }
+        return parse_wslpath_output(&output.stdout).map(PathBuf::from);
+    }
+    Ok(PathBuf::from(raw))
+}
+
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     for (mime, extension) in [
         ("image/png", "png"),
@@ -752,6 +883,22 @@ fn process_session_id(pid: u32) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reveal_wslpath_output_preserves_filename_spaces() {
+        assert_eq!(
+            parse_wslpath_output(b"C:\\a b \\file \n").unwrap(),
+            "C:\\a b \\file "
+        );
+        assert_eq!(
+            parse_wslpath_output(b"\\\\wsl.localhost\\Ubuntu\\home\\file\r\n").unwrap(),
+            "\\\\wsl.localhost\\Ubuntu\\home\\file"
+        );
+        assert!(parse_wslpath_output(b"\n").is_err());
+        assert!(parse_wslpath_output(b"C:\\a\nC:\\b\n").is_err());
+        assert!(parse_wslpath_output(b"C:\\a\0b\n").is_err());
+        assert!(parse_wslpath_output(&[0xff, b'\n']).is_err());
+    }
     use std::sync::{Mutex, OnceLock};
     use std::{cell::RefCell, collections::HashMap};
 

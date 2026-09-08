@@ -1078,6 +1078,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_path_hover_covers_only_path_and_tracks_soft_wrapping() {
+        let (app, info) = app_with_screen_bytes("• 文件：/home/herdr-usage/README.md".as_bytes());
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let hover = app
+            .state
+            .local_path_hover_at_pane_cell(&app.terminal_runtimes, pane, 0, 16)
+            .expect("path hover");
+        assert_eq!(
+            hover.cells.first(),
+            Some(&(info.inner_rect.x + 8, info.inner_rect.y))
+        );
+        assert_eq!(hover.cells.len(), "/home/herdr-usage/README.md".len());
+        assert!(app
+            .state
+            .local_path_hover_at_pane_cell(&app.terminal_runtimes, pane, 0, 3)
+            .is_none());
+
+        let path = format!("./{}file.txt", "a".repeat(info.inner_rect.width as usize));
+        let (app, info) = app_with_screen_bytes(path.as_bytes());
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let hover = app
+            .state
+            .local_path_hover_at_pane_cell(&app.terminal_runtimes, pane, 1, 1)
+            .expect("wrapped hover");
+        assert_eq!(hover.cells.len(), path.len());
+        assert!(hover
+            .cells
+            .contains(&(info.inner_rect.x, info.inner_rect.y + 1)));
+    }
+
+    #[tokio::test]
+    async fn local_path_hover_file_link_underlines_only_contiguous_label() {
+        let screen = b"\x1b]8;;file:///home/report.csv\x1b\\report\x1b]8;;\x1b\\ gap \x1b]8;;file:///home/report.csv\x1b\\again\x1b]8;;\x1b\\";
+        let (app, info) = app_with_screen_bytes(screen);
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let hover = app
+            .state
+            .local_path_hover_at_pane_cell(&app.terminal_runtimes, pane, 0, 1)
+            .expect("file link hover");
+        assert_eq!(hover.cells.len(), 6);
+        assert_eq!(
+            hover.cells.last(),
+            Some(&(info.inner_rect.x + 5, info.inner_rect.y))
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_cell_local_path_handles_codex_chinese_label_without_space() {
+        let (app, _) = app_with_screen_bytes("• 文件：/home/herdr-usage/README.md".as_bytes());
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        assert_eq!(
+            app.state
+                .local_path_at_pane_cell(&app.terminal_runtimes, pane, 0, 16)
+                .as_deref(),
+            Some("/home/herdr-usage/README.md")
+        );
+        assert_eq!(
+            app.state
+                .local_path_at_pane_cell(&app.terminal_runtimes, pane, 0, 3),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_cell_local_path_handles_wide_text_and_soft_wrap() {
+        let line = "报告 ./输出/report.csv:12:3";
+        let (app, _) = app_with_screen_bytes(line.as_bytes());
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        assert_eq!(
+            app.state
+                .local_path_at_pane_cell(&app.terminal_runtimes, pane, 0, 9)
+                .as_deref(),
+            Some("./输出/report.csv")
+        );
+        assert_eq!(
+            app.state
+                .local_path_at_pane_cell(&app.terminal_runtimes, pane, 0, 1),
+            None
+        );
+
+        let (_, info) = app_with_screen_bytes(b"");
+        let path = format!("./{}file.txt", "a".repeat(info.inner_rect.width as usize));
+        let (app, _) = app_with_screen_bytes(path.as_bytes());
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        assert_eq!(
+            app.state
+                .local_path_at_pane_cell(&app.terminal_runtimes, pane, 1, 1),
+            Some(path)
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_cell_local_path_resolves_explicit_file_hyperlink() {
+        let screen = b"\x1b]8;;file:///home/reports/a%20b.csv\x1b\\report\x1b]8;;\x1b\\";
+        let (app, _) = app_with_screen_bytes(screen);
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        assert_eq!(
+            app.state
+                .local_path_at_pane_cell(&app.terminal_runtimes, pane, 0, 1)
+                .as_deref(),
+            Some("/home/reports/a b.csv")
+        );
+        assert_eq!(
+            app.state
+                .url_at_pane_cell(&app.terminal_runtimes, pane, 0, 1),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn local_path_click_uses_pane_cwd_and_consumes_mouse_release() {
+        let (mut app, info) = app_with_screen_bytes(b"./output/report.csv");
+        app.state.ensure_test_terminals();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let mut received = None;
+        let expected_cwd = app.state.workspaces[0].tabs[0]
+            .cwd_for_pane(pane, &app.state.terminals, &app.terminal_runtimes)
+            .expect("pane cwd");
+        assert!(
+            app.handle_modified_local_path_click_with(41, pane, 0, 4, |path, cwd| received =
+                Some((path, cwd)))
+        );
+        assert_eq!(received, Some(("./output/report.csv".into(), expected_cwd)));
+        assert!(app.pending_url_click_sources.contains(&41));
+        assert!(app.last_pane_click.is_none());
+        app.handle_mouse_from_input_source(
+            41,
+            mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                info.inner_rect.x + 4,
+                info.inner_rect.y,
+            ),
+        );
+        assert!(!app.pending_url_click_sources.contains(&41));
+        assert!(app.state.selection.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn local_path_click_prefers_foreground_process_directory_over_shell() {
+        let directory = unique_temp_path("local-path-foreground-cwd");
+        std::fs::create_dir_all(&directory).expect("foreground directory");
+        let directory = directory.canonicalize().unwrap();
+        let mut app = app_with_spawned_workspace();
+        let pane = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0]
+            .terminal_id(pane)
+            .unwrap()
+            .clone();
+        app.state.view.pane_infos = app.state.workspaces[0].tabs[0]
+            .layout
+            .panes(Rect::new(0, 0, 80, 24));
+        let runtime = app.terminal_runtimes.get(&terminal_id).unwrap();
+        let shell_cwd = runtime.cwd().expect("shell cwd");
+        assert_ne!(shell_cwd, directory);
+        // The subshell and its foreground sleep change directories while the
+        // interactive parent shell retains its original working directory.
+        let quoted_directory = directory.to_string_lossy().replace('\'', "'\\''");
+        let command = format!(
+            "stty -echo; (cd '{quoted_directory}' && printf '\\033[2J\\033[H./output/report.csv'; sleep 30)\n"
+        );
+        runtime
+            .send_bytes(Bytes::from(command))
+            .await
+            .expect("send shell command");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let foreground = app
+                .terminal_runtimes
+                .get(&terminal_id)
+                .unwrap()
+                .foreground_cwd();
+            let path = app
+                .state
+                .local_path_at_pane_cell(&app.terminal_runtimes, pane, 0, 4);
+            if foreground.as_ref() == Some(&directory)
+                && path.as_deref() == Some("./output/report.csv")
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                shutdown_test_runtimes(&mut app);
+                let _ = std::fs::remove_dir_all(&directory);
+                panic!("foreground cwd or screen did not become ready: {foreground:?}, {path:?}");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let observed_shell_cwd = app.terminal_runtimes.get(&terminal_id).unwrap().cwd();
+        let mut received = None;
+        let handled = app.handle_modified_local_path_click_with(43, pane, 0, 4, |path, cwd| {
+            received = Some((path, cwd))
+        });
+        shutdown_test_runtimes(&mut app);
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(observed_shell_cwd, Some(shell_cwd));
+        assert!(handled);
+        assert_eq!(received, Some(("./output/report.csv".into(), directory)));
+    }
+
+    #[tokio::test]
     async fn pane_cell_url_resolver_finds_visible_url() {
         let line = "see https://example.com/pr/307.";
         let (app, info) = app_with_screen_bytes(line.as_bytes());

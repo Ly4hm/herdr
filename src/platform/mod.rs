@@ -25,6 +25,54 @@ pub enum Signal {
     Kill,
 }
 
+// Explorer accepts file selection as one argument, including the comma.
+#[cfg(any(target_os = "linux", windows))]
+fn explorer_reveal_argument(path: &std::ffi::OsStr, is_dir: bool) -> std::ffi::OsString {
+    let mut argument = std::ffi::OsString::new();
+    if !is_dir {
+        argument.push("/select,");
+    }
+    argument.push(path);
+    argument
+}
+
+/// Resolve a path extracted from terminal text against the clicked pane's CWD.
+/// Filesystem access and WSL conversion must run off the UI thread.
+pub fn resolve_local_path(raw: &str, cwd: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    if raw.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty local path",
+        ));
+    }
+    let path = if raw == "~" || raw.starts_with("~/") {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "home directory unavailable")
+            })?;
+        match raw.strip_prefix("~/") {
+            Some(relative) => home.join(relative),
+            None => home,
+        }
+    } else {
+        local_path_from_text_platform(raw)?
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    path.canonicalize()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn local_path_from_text_platform(raw: &str) -> std::io::Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(raw))
+}
+
 pub(crate) fn detached_custom_command_process(command: &str) -> std::process::Command {
     let mut process = detached_custom_command_process_platform(command);
     configure_background_command(&mut process);
@@ -379,6 +427,32 @@ impl PrefixInputSource for RealPrefixInputSource {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn reveal_explorer_keeps_spaces_and_shell_characters_in_one_argument() {
+        let path = std::ffi::OsStr::new(r"C:\项目\a b,$(echo hi).txt");
+        assert_eq!(explorer_reveal_argument(path, true), path);
+        assert_eq!(
+            explorer_reveal_argument(path, false),
+            std::ffi::OsStr::new(r"/select,C:\项目\a b,$(echo hi).txt")
+        );
+    }
+
+    #[test]
+    fn resolve_local_path_uses_pane_directory_and_rejects_missing_files() {
+        let cwd = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        assert_eq!(
+            resolve_local_path("./platform/mod.rs", &cwd).unwrap(),
+            cwd.join("platform/mod.rs").canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_local_path("../Cargo.toml", &cwd).unwrap(),
+            cwd.join("../Cargo.toml").canonicalize().unwrap()
+        );
+        assert!(resolve_local_path("./herdr-nonexistent-path-click-test", &cwd).is_err());
+        assert!(resolve_local_path("", &cwd).is_err());
+    }
 
     #[test]
     fn terminal_resize_signal_is_recorded_once_per_delivery() {

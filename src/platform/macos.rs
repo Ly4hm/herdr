@@ -532,6 +532,21 @@ pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
         .map(Some)
 }
 
+pub fn reveal_local_path(path: &std::path::Path) -> std::io::Result<Option<std::process::Child>> {
+    let path = path.canonicalize()?;
+    let mut command = Command::new("open");
+    if !path.is_dir() {
+        command.arg("-R");
+    }
+    command
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(Some)
+}
+
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
     let path = std::env::temp_dir().join(format!(
         "herdr-clipboard-image-{}-{}.png",

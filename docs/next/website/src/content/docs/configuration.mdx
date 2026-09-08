@@ -542,3 +542,32 @@ Common log files:
 ```
 
 Logs rotate automatically. Include the current log and rotated siblings when reporting issues.
+
+## Local path clicks (local WSL build)
+
+This local build extends Ctrl+left-click in terminal panes to reveal existing
+local paths. Directories open in File Explorer on WSL; files are selected in
+their containing directory. Ordinary clicks and HTTP/HTTPS handlers are unchanged.
+
+Relative paths such as `./output/report.csv` and `src/main.rs:42:7` resolve
+against the clicked pane's current working directory. Absolute Linux paths,
+Windows drive paths, quoted paths with spaces, Markdown path links, and local
+OSC 8 `file://` links are supported. File checks and the Explorer process run
+in a background worker only after a click. No background path scanning or output rewriting is used.
+
+Paths must exist. Quote or backtick paths containing spaces. Paths printed by
+a nested SSH/container process are outside this local-path feature's scope.
+
+On WSL, the opener uses `wslpath` and `explorer.exe`, with
+`/mnt/c/Windows/explorer.exe` as a fallback when Windows executables are absent
+from PATH. A PowerShell helper then finds the matching Explorer window, restores
+it if minimized, and requests foreground activation. The helper checks the actual
+foreground window and logs an activation failure if Windows declines the request.
+Linux desktop builds reveal the containing directory via `xdg-open`;
+macOS uses `open -R`; Windows uses Explorer selection.
+
+Hold Ctrl and move the mouse over a recognized local path to underline it.
+The underline preserves terminal colors and is cleared on ordinary mouse motion
+or input. Hover recognition does not access the filesystem; existence is checked
+only on click. Chinese prose prefixes such as `文件：/home/report.csv` are excluded
+from the recognized path.
