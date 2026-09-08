@@ -16,6 +16,7 @@ pub struct PathMatch {
 ///
 /// Quoted paths may contain spaces. Markdown links also match clicks on their
 /// label. Input must be one logical line, without ANSI escape sequences.
+#[cfg(test)]
 pub fn path_at_column(line: &str, col: u16) -> Option<String> {
     path_match_at_column(line, col).map(|matched| matched.path)
 }
