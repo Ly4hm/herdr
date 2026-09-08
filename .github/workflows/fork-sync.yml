@@ -1,0 +1,119 @@
+name: Sync stable upstream for local path fork
+
+on:
+  schedule:
+    - cron: '23 3 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Optional stable tag (vMAJOR.MINOR.PATCH); empty means latest stable'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-stable-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'Ly4hm/herdr' && github.ref == 'refs/heads/feature/local-path-click'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout personal branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: feature/local-path-click
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Test synchronization logic
+        run: python3 -m unittest scripts.test_fork_sync
+
+      - name: Prepare stable upstream merge
+        id: prepare
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          EVENT_NAME: ${{ github.event_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          options=(--tag "$UPSTREAM_TAG")
+          if [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            options+=(--validate-always)
+          fi
+          python3 scripts/fork_sync.py "${options[@]}"
+
+      - name: Install merged Rust toolchain
+        if: steps.prepare.outputs.validate == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ steps.prepare.outputs.rust }}
+          components: rustfmt,clippy
+
+      - name: Install test runner
+        if: steps.prepare.outputs.validate == 'true'
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: cargo-nextest
+
+      - name: Install merged Zig toolchain
+        if: steps.prepare.outputs.validate == 'true'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: ${{ steps.prepare.outputs.zig }}
+          use-cache: true
+
+      - name: Restore Cargo cache
+        if: steps.prepare.outputs.validate == 'true'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-bin: false
+          key: fork-sync-linux-${{ steps.prepare.outputs.rust }}-${{ steps.prepare.outputs.zig }}
+
+      - name: Validate merged code
+        if: steps.prepare.outputs.validate == 'true'
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo nextest run --locked --status-level fail --final-status-level fail --failure-output final --success-output never
+          python3 -m unittest scripts.test_ui_hot_path_architecture scripts.test_fork_sync
+          HERDR_BUILD_ID="local-path-$(git rev-parse --short HEAD)" cargo build --release --locked
+
+      - name: Upload personal Linux build
+        if: steps.prepare.outputs.validate == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: herdr-local-path-linux-x86_64
+          path: target/release/herdr
+          retention-days: 14
+
+      - name: Push validated merge to personal branch
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          # Credentials are available only to this final push. Explicit refspec,
+          # no tag following and no force: concurrent branch edits reject it.
+          gh auth setup-git
+          git -c push.followTags=false push https://github.com/Ly4hm/herdr.git HEAD:refs/heads/feature/local-path-click
+
+      - name: Summarize
+        if: success()
+        env:
+          UPSTREAM_TAG: ${{ steps.prepare.outputs.tag }}
+          CHANGED: ${{ steps.prepare.outputs.changed }}
+          VALIDATED: ${{ steps.prepare.outputs.validate }}
+        run: |
+          echo "Upstream: $UPSTREAM_TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "Merge pushed: $CHANGED; validation performed: $VALIDATED" >> "$GITHUB_STEP_SUMMARY"
