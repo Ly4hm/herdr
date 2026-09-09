@@ -7,6 +7,8 @@ pub(super) struct LocalPathHover {
     pane_id: String,
     path: String,
     area: Rect,
+    source_area: crate::protocol::SurfaceRect,
+    anchor: (u16, u16),
     boot_id: String,
     content_revision: u64,
     scroll: Option<crate::protocol::PaneSurfaceScrollMetrics>,
@@ -20,11 +22,10 @@ impl ClientShellState {
             && self.overlay.is_none()
             && self.popup_terminal_id.is_none()
             && self.endpoint_error.is_none()
-            && self.pending_pane_surface.is_none()
     }
 
     fn local_path_match_at_point(&self, column: u16, row: u16) -> Option<LocalPathHover> {
-        if !self.local_path_interaction_enabled() {
+        if !self.local_path_interaction_enabled() || !self.local_path_surface_coherent() {
             return None;
         }
         let surface = self.pane_surface.as_ref()?;
@@ -52,6 +53,8 @@ impl ClientShellState {
             pane_id: hit.pane_id.clone(),
             path,
             area: hit.inner_rect,
+            source_area: pane.inner_rect,
+            anchor: (column, row),
             boot_id: surface.boot_id.clone(),
             content_revision: pane.content_revision,
             scroll: pane.scroll,
@@ -64,16 +67,22 @@ impl ClientShellState {
             .map(|matched| (matched.pane_id, matched.path))
     }
 
-    /// Returns whether a repaint is needed. Work runs only on Ctrl+motion.
+    /// Returns whether a repaint is needed; unchanged paths reuse their cached span.
     pub(super) fn update_local_path_hover(&mut self, mouse: MouseEvent) -> bool {
+        let anchor = (mouse.column, mouse.row);
         let next = if mouse.kind == MouseEventKind::Moved
             && mouse.modifiers.contains(KeyModifiers::CONTROL)
         {
-            // Moving within the same unchanged path needs neither parsing nor allocation.
-            if self.local_path_hover.as_ref().is_some_and(|hover| {
-                self.local_path_hover_is_current(hover)
-                    && hover.cells.contains(&(mouse.column, mouse.row))
-            }) {
+            let retain = self.local_path_hover.as_ref().is_some_and(|hover| {
+                (self.local_path_hover_is_current(hover) && hover.cells.contains(&anchor))
+                    || (!self.local_path_surface_coherent()
+                        && self.local_path_hover_target(hover).is_some()
+                        && hover.area.contains(anchor.into()))
+            });
+            if retain {
+                if let Some(hover) = self.local_path_hover.as_mut() {
+                    hover.anchor = anchor;
+                }
                 return false;
             }
             self.local_path_match_at_point(mouse.column, mouse.row)
@@ -87,37 +96,67 @@ impl ClientShellState {
         true
     }
 
-    fn local_path_hover_is_current(&self, hover: &LocalPathHover) -> bool {
-        self.local_path_interaction_enabled()
+    fn local_path_surface_coherent(&self) -> bool {
+        self.pending_pane_surface.is_none()
             && self
+                .snapshot
+                .as_ref()
+                .zip(self.pane_surface.as_ref())
+                .is_some_and(|(snapshot, surface)| {
+                    snapshot.boot_id == surface.boot_id
+                        && snapshot.revision == surface.projection_revision
+                })
+    }
+
+    /// Content revisions can advance without invalidating the stationary pointer.
+    /// A growing scrollback maximum is output growth, not a viewport scroll.
+    fn local_path_hover_target(
+        &self,
+        hover: &LocalPathHover,
+    ) -> Option<&crate::protocol::PaneSurfacePane> {
+        if !self.local_path_interaction_enabled()
+            || !self
                 .hits
                 .panes
                 .iter()
                 .any(|hit| hit.pane_id == hover.pane_id && hit.inner_rect == hover.area)
-            && self.pane_surface.as_ref().is_some_and(|surface| {
-                surface.boot_id == hover.boot_id
-                    && self
-                        .snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| snapshot.revision == surface.projection_revision)
-                    && surface.panes.iter().any(|pane| {
-                        pane.pane_id == hover.pane_id
-                            && pane.content_revision == hover.content_revision
-                            && pane.scroll == hover.scroll
-                            && pane.inner_rect.width == hover.area.width
-                            && pane.inner_rect.height == hover.area.height
-                    })
-            })
+        {
+            return None;
+        }
+        let surface = self.pane_surface.as_ref()?;
+        if surface.boot_id != hover.boot_id {
+            return None;
+        }
+        surface.panes.iter().find(|pane| {
+            pane.pane_id == hover.pane_id
+                && pane.inner_rect == hover.source_area
+                && scroll_viewport(pane.scroll) == scroll_viewport(hover.scroll)
+        })
     }
 
+    fn local_path_hover_is_current(&self, hover: &LocalPathHover) -> bool {
+        self.local_path_surface_coherent()
+            && self
+                .local_path_hover_target(hover)
+                .is_some_and(|pane| pane.content_revision == hover.content_revision)
+            && hover.cells.contains(&hover.anchor)
+    }
+
+    /// Refresh the one hovered row after output changes. A temporarily unmatched
+    /// snapshot/surface pair suppresses rendering but retains the pointer intent.
     pub(super) fn clear_stale_local_path_hover(&mut self) {
-        if self
-            .local_path_hover
-            .as_ref()
-            .is_some_and(|hover| !self.local_path_hover_is_current(hover))
-        {
+        let Some(hover) = self.local_path_hover.as_ref() else {
+            return;
+        };
+        if self.local_path_hover_target(hover).is_none() {
             self.local_path_hover = None;
+            return;
         }
+        if !self.local_path_surface_coherent() || self.local_path_hover_is_current(hover) {
+            return;
+        }
+        let (column, row) = hover.anchor;
+        self.local_path_hover = self.local_path_match_at_point(column, row);
     }
 
     pub(super) fn render_local_path_hover(&self, frame: &mut FrameData) {
@@ -137,6 +176,12 @@ impl ClientShellState {
             }
         }
     }
+}
+
+fn scroll_viewport(
+    scroll: Option<crate::protocol::PaneSurfaceScrollMetrics>,
+) -> Option<(u64, u64)> {
+    scroll.map(|scroll| (scroll.offset_from_bottom, scroll.viewport_rows))
 }
 
 fn frame_cell(frame: &FrameData, x: u16, y: u16) -> Option<&crate::protocol::CellData> {
@@ -313,14 +358,175 @@ mod tests {
         assert!(state.local_path_hover.is_none());
     }
 
+    fn replace_surface_text(state: &mut ClientShellState, text: &str) {
+        let surface = state.pane_surface.as_mut().unwrap();
+        let mut buffer = Buffer::empty(Rect::new(0, 0, surface.frame.width, surface.frame.height));
+        buffer.set_string(0, 0, text, Style::default());
+        surface.frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+        surface.panes[0].content_revision += 2;
+    }
+
     #[test]
-    fn hover_invalidates_on_content_scroll_geometry_and_mode_changes() {
-        for case in 0..4 {
+    fn stationary_hover_refreshes_through_output_and_scrollback_growth() {
+        let mut state = shell_with_path();
+        let metrics = crate::protocol::PaneSurfaceScrollMetrics {
+            offset_from_bottom: 0,
+            max_offset_from_bottom: 10,
+            viewport_rows: 1,
+        };
+        state.pane_surface.as_mut().unwrap().panes[0].scroll = Some(metrics);
+        state.update_local_path_hover(ctrl_motion());
+        let cells = state.local_path_hover.as_ref().unwrap().cells.clone();
+        for _ in 0..3 {
+            let surface = state.pane_surface.as_mut().unwrap();
+            surface.panes[0].content_revision += 2;
+            surface.panes[0]
+                .scroll
+                .as_mut()
+                .unwrap()
+                .max_offset_from_bottom += 1;
+            state.clear_stale_local_path_hover();
+            assert_eq!(state.local_path_hover.as_ref().unwrap().cells, cells);
+            let mut frame = state.pane_surface.as_ref().unwrap().frame.clone();
+            state.render_local_path_hover(&mut frame);
+            for &(x, y) in &cells {
+                assert_ne!(
+                    frame_cell(&frame, x, y).unwrap().modifier & Modifier::UNDERLINED.bits(),
+                    0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn changed_or_disappearing_path_does_not_reuse_the_old_underline_range() {
+        let mut state = shell_with_path();
+        state.update_local_path_hover(ctrl_motion());
+        replace_surface_text(&mut state, "文件：/a/b,");
+        let mut frame = state.pane_surface.as_ref().unwrap().frame.clone();
+        let before = frame.clone();
+        state.render_local_path_hover(&mut frame);
+        assert_eq!(frame, before, "old span must not render before refresh");
+        state.clear_stale_local_path_hover();
+        let hover = state.local_path_hover.as_ref().unwrap();
+        assert_eq!(hover.path, "/a/b");
+        assert_eq!(hover.cells, vec![(6, 0), (7, 0), (8, 0), (9, 0)]);
+        replace_surface_text(&mut state, "the path disappeared");
+        state.clear_stale_local_path_hover();
+        assert!(state.local_path_hover.is_none());
+    }
+
+    #[test]
+    fn transient_surface_mismatch_retains_pointer_intent_and_recovers_without_motion() {
+        for pending in [false, true] {
+            let mut state = shell_with_path();
+            state.update_local_path_hover(ctrl_motion());
+            if pending {
+                state.pending_pane_surface = state.pane_surface.clone();
+            } else {
+                state.snapshot.as_mut().unwrap().revision += 1;
+            }
+            state.clear_stale_local_path_hover();
+            assert!(state.local_path_hover.is_some());
+            let mut mouse = ctrl_motion();
+            mouse.column += 1;
+            state.update_local_path_hover(mouse);
+            assert_eq!(state.local_path_hover.as_ref().unwrap().anchor, (9, 0));
+            let mut frame = state.pane_surface.as_ref().unwrap().frame.clone();
+            let before = frame.clone();
+            state.render_local_path_hover(&mut frame);
+            assert_eq!(
+                frame, before,
+                "unmatched surfaces must not draw cached spans"
+            );
+            state.pending_pane_surface = None;
+            state.pane_surface.as_mut().unwrap().projection_revision =
+                state.snapshot.as_ref().unwrap().revision;
+            state.pane_surface.as_mut().unwrap().panes[0].content_revision += 2;
+            state.clear_stale_local_path_hover();
+            assert!(state
+                .local_path_hover
+                .as_ref()
+                .is_some_and(|hover| state.local_path_hover_is_current(hover)));
+        }
+    }
+
+    #[test]
+    fn pointer_moves_during_mismatch_refresh_the_latest_anchor_or_clear_outside_the_pane() {
+        let mut state = shell_with_path();
+        state.update_local_path_hover(ctrl_motion());
+        state.snapshot.as_mut().unwrap().revision += 1;
+        let mut mouse = ctrl_motion();
+        mouse.column = 1; // Still in the pane, but now over prose rather than the path.
+        state.update_local_path_hover(mouse);
+        assert!(state.local_path_hover.is_some());
+        state.pane_surface.as_mut().unwrap().projection_revision += 1;
+        state.clear_stale_local_path_hover();
+        assert!(state.local_path_hover.is_none());
+        state.update_local_path_hover(ctrl_motion());
+        state.snapshot.as_mut().unwrap().revision += 1;
+        mouse.column = 100;
+        state.update_local_path_hover(mouse);
+        assert!(state.local_path_hover.is_none());
+    }
+
+    #[test]
+    fn host_replies_and_control_repeats_retain_hover_but_user_input_and_focus_loss_clear_it() {
+        use crate::raw_input::RawInputEvent;
+        use crossterm::event::{KeyEventKind, ModifierKeyCode};
+        let control = crate::input::TerminalKey::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftControl),
+            KeyModifiers::CONTROL,
+        );
+        let mut state = shell_with_path();
+        state.update_local_path_hover(ctrl_motion());
+        let color = crate::terminal_theme::RgbColor {
+            r: 10,
+            g: 20,
+            b: 30,
+        };
+        for event in [
+            RawInputEvent::HostDefaultColor {
+                kind: crate::terminal_theme::DefaultColorKind::Foreground,
+                color,
+            },
+            RawInputEvent::HostPaletteColors {
+                colors: vec![(1, color)],
+            },
+            RawInputEvent::HostCellSizeReport {
+                width_px: 8,
+                height_px: 16,
+            },
+            RawInputEvent::Unsupported,
+            RawInputEvent::Key(control.clone()),
+            RawInputEvent::Key(control.clone().with_kind(KeyEventKind::Repeat)),
+        ] {
+            state.handle_raw_events(vec![event]);
+            assert!(state.local_path_hover.is_some());
+        }
+        for event in [
+            RawInputEvent::Key(control.with_kind(KeyEventKind::Release)),
+            RawInputEvent::Key(crate::input::TerminalKey::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )),
+            RawInputEvent::Paste("hello".into()),
+            RawInputEvent::OuterFocusLost,
+        ] {
+            state.update_local_path_hover(ctrl_motion());
+            assert!(state.local_path_hover.is_some());
+            state.handle_raw_events(vec![event]);
+            assert!(state.local_path_hover.is_none());
+        }
+    }
+
+    #[test]
+    fn hover_invalidates_on_scroll_geometry_and_mode_changes() {
+        for case in 0..5 {
             let mut state = shell_with_path();
             assert!(state.update_local_path_hover(ctrl_motion()));
             match case {
-                0 => state.pane_surface.as_mut().unwrap().panes[0].content_revision += 1,
-                1 => {
+                0 => {
                     state.pane_surface.as_mut().unwrap().panes[0].scroll =
                         Some(crate::protocol::PaneSurfaceScrollMetrics {
                             offset_from_bottom: 1,
@@ -328,7 +534,9 @@ mod tests {
                             viewport_rows: 1,
                         })
                 }
-                2 => state.hits.panes[0].inner_rect.x += 1,
+                1 => state.hits.panes[0].inner_rect.x += 1,
+                2 => state.pane_surface.as_mut().unwrap().panes[0].inner_rect.x += 1,
+                3 => state.pane_surface.as_mut().unwrap().boot_id = "new-boot".into(),
                 _ => state.mode = ClientShellMode::Copy,
             }
             let mut frame = state.pane_surface.as_ref().unwrap().frame.clone();
@@ -372,23 +580,43 @@ mod tests {
             let hover = state.local_path_hover.take().unwrap();
             let buffer = Buffer::empty(Rect::new(0, 0, 120, 40));
             let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
-            let mut medians = [Duration::ZERO; 2];
-            for (case, active) in [false, true].into_iter().enumerate() {
-                state.local_path_hover = active.then(|| hover.clone());
+            let mut medians = [Duration::ZERO; 3];
+            for (case, median) in medians.iter_mut().enumerate() {
+                state.local_path_hover = (case != 0).then(|| hover.clone());
+                state
+                    .pane_surface
+                    .as_mut()
+                    .unwrap()
+                    .panes
+                    .last_mut()
+                    .unwrap()
+                    .content_revision = hover.content_revision;
                 let mut samples = [Duration::ZERO; 3];
                 for elapsed in &mut samples {
                     let start = Instant::now();
                     for _ in 0..ITERATIONS {
+                        if case == 2 {
+                            state
+                                .pane_surface
+                                .as_mut()
+                                .unwrap()
+                                .panes
+                                .last_mut()
+                                .unwrap()
+                                .content_revision += 2;
+                        }
+                        black_box(&mut state).clear_stale_local_path_hover();
                         black_box(&state).render_local_path_hover(black_box(&mut frame));
                     }
                     *elapsed = start.elapsed();
                 }
                 samples.sort();
-                medians[case] = samples[1];
+                *median = samples[1];
             }
             let none = medians[0].as_nanos() as f64 / f64::from(ITERATIONS);
-            let active = medians[1].as_nanos() as f64 / f64::from(ITERATIONS);
-            eprintln!("client local_path_hover_render_scale_profile: panes={pane_count}, geometry=120x40, none={none:.1} ns/frame, hover={active:.1} ns/frame, delta={:.1} ns/frame", active - none);
+            let unchanged = medians[1].as_nanos() as f64 / f64::from(ITERATIONS);
+            let changed = medians[2].as_nanos() as f64 / f64::from(ITERATIONS);
+            eprintln!("client local_path_hover_render_scale_profile: panes={pane_count}, geometry=120x40, refresh+render none={none:.1} ns/frame, unchanged={unchanged:.1} ns/frame, changed_parse={changed:.1} ns/frame");
         }
     }
 

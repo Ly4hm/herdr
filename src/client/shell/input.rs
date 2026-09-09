@@ -159,7 +159,22 @@ impl ClientShellState {
             outcome.repaint = true;
         }
         for event in events {
-            if !matches!(event, RawInputEvent::Mouse(_)) && self.local_path_hover.take().is_some() {
+            let clears_path_hover = match &event {
+                RawInputEvent::Key(key) => {
+                    !matches!(
+                        key.code,
+                        KeyCode::Modifier(
+                            crossterm::event::ModifierKeyCode::LeftControl
+                                | crossterm::event::ModifierKeyCode::RightControl
+                        )
+                    ) || key.kind == KeyEventKind::Release
+                }
+                RawInputEvent::Text(_)
+                | RawInputEvent::Paste(_)
+                | RawInputEvent::OuterFocusLost => true,
+                _ => false,
+            };
+            if clears_path_hover && self.local_path_hover.take().is_some() {
                 outcome.repaint = true;
             }
             if let Some(update) = host_theme_update(&event) {

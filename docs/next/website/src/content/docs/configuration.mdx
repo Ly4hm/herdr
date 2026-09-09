@@ -610,8 +610,10 @@ Linux desktop builds reveal the containing directory via `xdg-open`;
 macOS uses `open -R`; Windows uses Explorer selection.
 
 Hold Ctrl and move the mouse over a recognized local path to underline it.
-The underline preserves terminal colors and is cleared on ordinary mouse motion
-or input. Hover recognition does not access the filesystem; existence is checked
+The underline preserves terminal colors and stays visible through output updates
+while a recognized path remains under the pointer. Ordinary mouse motion, Ctrl
+release, scrolling, or text input clears it. Hover recognition does not access
+the filesystem; existence is checked
 only on click. Chinese prose prefixes such as `文件：/home/report.csv` are excluded
 from the recognized path.
 
