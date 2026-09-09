@@ -7,8 +7,9 @@ Branch: `feature/local-path-click`
 Upstream: https://github.com/herdrdev/herdr
 
 This branch adds Ctrl+click on local paths to open directories or reveal files in
-the system file manager, with Ctrl-hover underlines. Relative paths use the local
-pane's foreground working directory, falling back to its shell working directory.
+the system file manager, with Ctrl-hover underlines. Relative paths use the current
+Codex session's recorded project directory when available, then the local pane's
+foreground working directory or shell working directory.
 Remote endpoint paths are not opened on the client machine. WSL uses Windows
 Explorer and requests foreground activation of the matching window.
 
@@ -58,3 +59,10 @@ permission; no upstream write permission or personal access token is required.
 
 Official `herdr update` installs the upstream build and would replace this feature.
 Use this branch's build when the extension is needed.
+
+For resumed Codex sessions, local path clicks use the working directory recorded
+in the exact session's native metadata when available. This can differ from the
+Codex process directory after a restart. Session lookup runs only in the click
+worker and matches the pane's session ID; other projects are never searched to
+resolve a missing file. If session metadata is unavailable, the pane's process
+working directory remains the fallback. Absolute paths keep their usual meaning.

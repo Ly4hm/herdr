@@ -881,10 +881,16 @@ impl ClientShellState {
                                 .find(|pane| pane.pane_id == pane_id)
                                 .and_then(|pane| pane.foreground_cwd.as_ref().or(pane.cwd.as_ref()))
                         }) {
-                            outcome.actions.push(ClientShellAction::RevealLocalPath {
-                                raw,
-                                cwd: std::path::PathBuf::from(cwd),
-                            });
+                            let cwd = std::path::PathBuf::from(cwd);
+                            self.push_endpoint_method_with_kind(
+                                crate::api::schema::Method::PaneGet(
+                                    crate::api::schema::PaneTarget {
+                                        pane_id: pane_id.clone(),
+                                    },
+                                ),
+                                PendingEndpointKind::RevealLocalPath { pane_id, raw, cwd },
+                                outcome,
+                            );
                             self.last_pane_click = None;
                             self.url_click_consumes_until_up = true;
                             return;

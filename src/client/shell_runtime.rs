@@ -47,16 +47,44 @@ pub(super) fn dispatch_client_shell_actions(
                     }
                 }
             }
-            shell::ClientShellAction::RevealLocalPath { raw, cwd } => {
+            shell::ClientShellAction::RevealLocalPath {
+                raw,
+                cwd,
+                agent_session,
+            } => {
                 tokio::task::spawn_blocking(move || {
-                    let result = crate::platform::resolve_local_path(&raw, &cwd)
-                        .and_then(|path| crate::platform::reveal_local_path(&path));
-                    match result {
+                    let session_cwd = if std::path::Path::new(&raw).is_relative()
+                        && !raw.starts_with('~')
+                    {
+                        agent_session.as_ref().and_then(|session| {
+                            match crate::integration::agent_session_cwd(session) {
+                                Ok(cwd) => cwd,
+                                Err(err) => {
+                                    warn!(%err, session_id = %session.value, "could not read session working directory");
+                                    None
+                                }
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    let cwd = session_cwd.unwrap_or(cwd);
+                    let path = match crate::platform::resolve_local_path(&raw, &cwd) {
+                        Ok(path) => path,
+                        Err(err) => {
+                            warn!(%err, path = %raw, cwd = %cwd.display(), "could not resolve local path");
+                            return;
+                        }
+                    };
+                    tracing::info!(path = %raw, cwd = %cwd.display(), resolved = %path.display(), "revealing local path");
+                    match crate::platform::reveal_local_path(&path) {
                         Ok(Some(mut child)) => {
                             let _ = child.wait();
                         }
                         Ok(None) => {}
-                        Err(err) => warn!(%err, path = %raw, "could not reveal local path"),
+                        Err(err) => {
+                            warn!(%err, path = %path.display(), "could not reveal local path")
+                        }
                     }
                 });
             }

@@ -6,6 +6,7 @@ mod env;
 mod file_ops;
 mod opencode_config;
 mod registry;
+mod session_cwd;
 mod targets;
 mod types;
 mod version;
@@ -20,6 +21,7 @@ pub(crate) use registry::{
     installed_integration_statuses, integration_recommendations, integration_target_label,
     print_outdated_update_notice,
 };
+pub(crate) use session_cwd::agent_session_cwd;
 pub(crate) use types::{IntegrationRecommendation, IntegrationStatus, IntegrationStatusKind};
 
 const PI_EXTENSION_INSTALL_NAME: &str = "herdr-agent-state.ts";

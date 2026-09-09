@@ -593,7 +593,7 @@ local paths. Directories open in File Explorer on WSL; files are selected in
 their containing directory. Ordinary clicks and HTTP/HTTPS handlers are unchanged.
 
 Relative paths such as `./output/report.csv` and `src/main.rs:42:7` resolve
-against the local pane's foreground working directory, falling back to its shell working directory. Absolute Linux paths,
+against the current Codex session's recorded project directory when available, otherwise the local pane's foreground or shell working directory. Absolute Linux paths,
 Windows drive paths, quoted paths with spaces, Markdown path links, and local
 OSC 8 `file://` links are supported. File checks and the Explorer process run
 in a background worker only after a click. No background path scanning or output rewriting is used.
@@ -618,3 +618,10 @@ from the recognized path.
 In the v0.9 client shell, plain paths must fit on one visible terminal row;
 OSC 8 `file://` links can retain their full target across wrapped labels. Remote
 endpoint paths are not opened on the local client.
+
+For resumed Codex sessions, local path clicks use the working directory recorded
+in the exact session's native metadata when available. This can differ from the
+Codex process directory after a restart. Session lookup runs only in the click
+worker and matches the pane's session ID; other projects are never searched to
+resolve a missing file. If session metadata is unavailable, the pane's process
+working directory remains the fallback. Absolute paths keep their usual meaning.

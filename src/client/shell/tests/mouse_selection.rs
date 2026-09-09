@@ -29,6 +29,31 @@ fn local_path_click_event(state: &ClientShellState, control: bool) -> MouseEvent
     }
 }
 
+fn local_path_metadata_request_id(outcome: &ClientShellInput) -> String {
+    assert!(outcome.requests.is_empty());
+    let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
+        panic!("expected metadata request before opening a local path");
+    };
+    assert!(
+        matches!(&request.method, crate::api::schema::Method::PaneGet(target) if target.pane_id == "pane_1")
+    );
+    request.id.clone()
+}
+
+fn local_path_metadata_result() -> crate::api::schema::ResponseResult {
+    let mut result = pane_scroll_result(0, 0, 1);
+    let crate::api::schema::ResponseResult::PaneInfo { pane } = &mut result else {
+        unreachable!();
+    };
+    pane.agent_session = Some(crate::api::schema::AgentSessionInfo {
+        source: "herdr:codex".into(),
+        agent: "codex".into(),
+        kind: crate::agent_resume::AgentSessionRefKind::Id,
+        value: "session-from-pane-api".into(),
+    });
+    result
+}
+
 #[test]
 fn ctrl_local_path_click_resolves_against_foreground_cwd_then_pane_cwd() {
     for (foreground_cwd, expected_cwd) in [(Some("/repo/task"), "/repo/task"), (None, "/repo")] {
@@ -40,11 +65,16 @@ fn ctrl_local_path_click_resolves_against_foreground_cwd_then_pane_cwd() {
         state.compose(106, 20).expect("local path frame");
         let click = local_path_click_event(&state, true);
         let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(click)]);
-        assert!(outcome.requests.is_empty());
+        let request_id = local_path_metadata_request_id(&outcome);
+        let (_, actions) =
+            state.handle_endpoint_result("boot-1", &request_id, Ok(local_path_metadata_result()));
         assert!(matches!(
-            &outcome.actions[..],
-            [ClientShellAction::RevealLocalPath { raw, cwd }]
+            &actions[..],
+            [ClientShellAction::RevealLocalPath { raw, cwd, agent_session: Some(session) }]
                 if raw == "./output/report.csv" && cwd == std::path::Path::new(expected_cwd)
+                    && session.agent == "codex" && session.source == "herdr:codex"
+                    && session.kind == crate::agent_resume::AgentSessionRefKind::Id
+                    && session.value == "session-from-pane-api"
         ));
         assert!(state.selection.is_none());
     }
@@ -60,11 +90,7 @@ fn ctrl_local_path_click_consumes_drag_and_release_without_pty_input() {
     state.compose(106, 20).expect("local path frame");
     let down = local_path_click_event(&state, true);
     let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(down)]);
-    assert!(matches!(
-        &outcome.actions[..],
-        [ClientShellAction::RevealLocalPath { .. }]
-    ));
-    assert!(outcome.requests.is_empty());
+    let request_id = local_path_metadata_request_id(&outcome);
     for kind in [
         MouseEventKind::Drag(MouseButton::Left),
         MouseEventKind::Up(MouseButton::Left),
@@ -78,11 +104,16 @@ fn ctrl_local_path_click_consumes_drag_and_release_without_pty_input() {
         assert!(state.selection.is_none());
     }
     assert!(!state.url_click_consumes_until_up);
-    let next = state.handle_raw_events(vec![RawInputEvent::Mouse(down)]);
+    let (_, actions) =
+        state.handle_endpoint_result("boot-1", &request_id, Ok(local_path_metadata_result()));
     assert!(matches!(
-        &next.actions[..],
+        &actions[..],
         [ClientShellAction::RevealLocalPath { .. }]
     ));
+    // A completed response does not reinstate the already consumed release.
+    assert!(!state.url_click_consumes_until_up);
+    let next = state.handle_raw_events(vec![RawInputEvent::Mouse(down)]);
+    local_path_metadata_request_id(&next);
 }
 
 #[test]
@@ -99,6 +130,89 @@ fn local_path_without_control_still_starts_normal_text_selection() {
         .iter()
         .any(|action| matches!(action, ClientShellAction::RevealLocalPath { .. })));
     assert!(!state.url_click_consumes_until_up);
+}
+
+#[test]
+fn local_path_metadata_failures_and_stale_responses_never_open_files() {
+    for scenario in [
+        "wrong_pane",
+        "wrong_boot",
+        "removed_pane",
+        "cancelled",
+        "stale",
+        "api_error",
+    ] {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        state.set_pane_surface(local_path_click_surface("./output/report.csv"));
+        state.compose(106, 20).expect("local path frame");
+        let down = local_path_click_event(&state, true);
+        let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(down)]);
+        let request_id = local_path_metadata_request_id(&outcome);
+        let mut result = local_path_metadata_result();
+        if scenario == "wrong_pane" {
+            let crate::api::schema::ResponseResult::PaneInfo { pane } = &mut result else {
+                unreachable!();
+            };
+            pane.pane_id = "pane_2".into();
+        }
+        if scenario == "removed_pane" {
+            state.snapshot.as_mut().unwrap().panes.clear();
+        }
+        let result = match scenario {
+            "cancelled" | "stale" | "api_error" => Err(ClientShellEndpointError {
+                code: Some(
+                    match scenario {
+                        "cancelled" => "endpoint_cancelled",
+                        "stale" => "stale_target",
+                        _ => "pane_not_found",
+                    }
+                    .into(),
+                ),
+                message: "metadata unavailable".into(),
+            }),
+            _ => Ok(result),
+        };
+        let boot = if scenario == "wrong_boot" {
+            "previous-boot"
+        } else {
+            "boot-1"
+        };
+        let (_, actions) = state.handle_endpoint_result(boot, &request_id, result);
+        assert!(actions.is_empty(), "{scenario}");
+        if matches!(scenario, "wrong_pane" | "api_error") {
+            assert!(state.endpoint_error.is_some(), "{scenario}");
+        }
+        // A duplicate/late successful response for the consumed request is ignored.
+        let (_, actions) =
+            state.handle_endpoint_result("boot-1", &request_id, Ok(local_path_metadata_result()));
+        assert!(actions.is_empty(), "duplicate after {scenario}");
+    }
+}
+
+#[test]
+fn local_path_metadata_without_an_agent_session_preserves_plain_terminal_opening() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    state.set_snapshot(Box::new(snapshot()));
+    state.set_pane_surface(local_path_click_surface("./output/report.csv"));
+    state.compose(106, 20).expect("local path frame");
+    let down = local_path_click_event(&state, true);
+    let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(down)]);
+    let request_id = local_path_metadata_request_id(&outcome);
+    let (_, actions) =
+        state.handle_endpoint_result("boot-1", &request_id, Ok(pane_scroll_result(0, 0, 1)));
+    assert!(matches!(
+        &actions[..],
+        [ClientShellAction::RevealLocalPath {
+            agent_session: None,
+            ..
+        }]
+    ));
+    let up = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..down
+    })]);
+    assert!(up.requests.is_empty() && up.actions.is_empty());
 }
 
 #[test]

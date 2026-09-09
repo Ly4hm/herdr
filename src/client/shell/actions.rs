@@ -706,6 +706,50 @@ impl ClientShellState {
                 self.request_selection_copy(&mut outcome, false);
                 return (true, outcome.actions);
             }
+            PendingEndpointKind::RevealLocalPath { pane_id, raw, cwd } => {
+                if !self.active_endpoint_id.is_local()
+                    || self.mode != ClientShellMode::Terminal
+                    || self.overlay.is_some()
+                    || !self.hits.panes.iter().any(|hit| hit.pane_id == pane_id)
+                    || self.snapshot.as_ref().is_none_or(|snapshot| {
+                        !snapshot.panes.iter().any(|pane| pane.pane_id == pane_id)
+                    })
+                {
+                    return (false, Vec::new());
+                }
+                return match result {
+                    Ok(crate::api::schema::ResponseResult::PaneInfo { pane })
+                        if pane.pane_id == pane_id =>
+                    {
+                        (
+                            false,
+                            vec![ClientShellAction::RevealLocalPath {
+                                raw,
+                                cwd,
+                                agent_session: pane.agent_session,
+                            }],
+                        )
+                    }
+                    Ok(_) => {
+                        self.endpoint_error = Some(
+                            "endpoint returned mismatched local-path pane metadata".to_owned(),
+                        );
+                        (true, Vec::new())
+                    }
+                    Err(error)
+                        if matches!(
+                            error.code.as_deref(),
+                            Some("stale_content" | "stale_target" | "endpoint_cancelled")
+                        ) =>
+                    {
+                        (false, Vec::new())
+                    }
+                    Err(error) => {
+                        self.endpoint_error = Some(error.message);
+                        (true, Vec::new())
+                    }
+                };
+            }
             PendingEndpointKind::PaneLinkActivate {
                 pane_id,
                 inner_rect,

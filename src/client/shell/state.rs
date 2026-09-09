@@ -302,6 +302,7 @@ pub(crate) enum ClientShellAction {
     RevealLocalPath {
         raw: String,
         cwd: std::path::PathBuf,
+        agent_session: Option<crate::api::schema::AgentSessionInfo>,
     },
     ActivateEndpoint {
         endpoint_id: ClientEndpointId,
@@ -707,6 +708,11 @@ pub(super) enum PendingEndpointKind {
         pane_id: String,
         inner_rect: Rect,
         fallback_events: Vec<crossterm::event::MouseEvent>,
+    },
+    RevealLocalPath {
+        pane_id: String,
+        raw: String,
+        cwd: std::path::PathBuf,
     },
     CopyMotion {
         pane_id: String,
