@@ -24,6 +24,7 @@ const CLIENT_SHELL_METHODS: &[&str] = &[
     "pane.edit_scrollback",
     "pane.focus",
     "pane.focus_direction",
+    "pane.get",
     "pane.input.set",
     "pane.link.activate",
     "pane.rename",
@@ -280,12 +281,31 @@ mod tests {
 
     #[test]
     fn advertised_client_shell_method_shapes_stay_at_the_v1_contract() {
-        let expected: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
+        let mut expected: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/endpoint-method-shapes-v1.json"
         )))
         .expect("endpoint method shape fixture");
+        // Preserve the published baseline verbatim. The personal fork advertises
+        // an additional existing API method, without changing any published shape.
+        let extensions: BTreeMap<String, String> = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/endpoint-method-shapes-local-path-v1.json"
+        )))
+        .expect("local path endpoint method shape fixture");
         let actual = endpoint_method_shape_digests();
+        for (method, digest) in extensions {
+            assert!(
+                !expected.contains_key(&method),
+                "extensions must not override published endpoint methods"
+            );
+            assert_eq!(
+                actual.get(&method),
+                Some(&digest),
+                "new method {method} changed shape"
+            );
+            expected.insert(method, digest);
+        }
 
         assert_eq!(
             actual,

@@ -111,6 +111,23 @@ fn decode_endpoint_request(request: &str) -> serde_json::Result<DecodedEndpointR
         },
     )
 }
+/// Exercise the actual transport decoder from client interaction regression tests.
+#[cfg(test)]
+pub(crate) fn assert_endpoint_request_dispatches(request: &crate::api::schema::Request) {
+    let serialized = serde_json::to_string(request).expect("serialize endpoint request");
+    match decode_endpoint_request(&serialized).expect("decode endpoint request") {
+        DecodedEndpointRequest::Dispatch(decoded) => {
+            assert_eq!(
+                serde_json::to_value(&*decoded).unwrap(),
+                serde_json::to_value(request).unwrap()
+            );
+        }
+        DecodedEndpointRequest::Error { code, message, .. } => {
+            panic!("endpoint transport rejected click request: {code}: {message}");
+        }
+    }
+}
+
 /// Maximum structured input events accepted in one client message.
 const MAX_INPUT_EVENT_BATCH: usize = 4096;
 

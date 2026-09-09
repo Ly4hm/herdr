@@ -55,6 +55,62 @@ fn local_path_metadata_result() -> crate::api::schema::ResponseResult {
 }
 
 #[test]
+fn ctrl_local_path_click_passes_real_advertised_capabilities_and_endpoint_transport() {
+    for advertise_metadata in [false, true] {
+        let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+        state.set_snapshot(Box::new(snapshot()));
+        let welcome = crate::protocol::endpoint::EndpointServerWelcome::compatible(
+            crate::server::client_commands::supported_client_shell_method_names()
+                .iter()
+                .map(|method| (*method).to_owned())
+                .collect(),
+        );
+        let welcome: crate::protocol::endpoint::EndpointServerWelcome =
+            serde_json::from_str(&serde_json::to_string(&welcome).unwrap()).unwrap();
+        state.set_endpoint_methods(Some(
+            welcome
+                .methods
+                .into_iter()
+                .filter(|method| advertise_metadata || method != "pane.get")
+                .collect(),
+        ));
+        state.set_pane_surface(local_path_click_surface("./output/report.csv"));
+        state.compose(106, 20).expect("local path frame");
+        let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(local_path_click_event(
+            &state, true,
+        ))]);
+        if !advertise_metadata {
+            assert!(
+                outcome.actions.is_empty(),
+                "the old capability set must reproduce the rejected click"
+            );
+            assert_eq!(
+                state
+                    .visible_endpoint_notice
+                    .as_ref()
+                    .map(|notice| notice.title.as_str()),
+                Some("Action unavailable")
+            );
+            continue;
+        }
+        let request_id = local_path_metadata_request_id(&outcome);
+        let [ClientShellAction::Endpoint { request, .. }] = &outcome.actions[..] else {
+            unreachable!()
+        };
+        crate::server::client_transport::assert_endpoint_request_dispatches(request);
+        assert!(
+            state.visible_endpoint_notice.is_none(),
+            "advertised pane metadata must not show Action unavailable"
+        );
+        let (_, actions) =
+            state.handle_endpoint_result("boot-1", &request_id, Ok(local_path_metadata_result()));
+        assert!(
+            matches!(&actions[..], [ClientShellAction::RevealLocalPath { raw, agent_session: Some(_), .. }] if raw == "./output/report.csv")
+        );
+    }
+}
+
+#[test]
 fn ctrl_local_path_click_resolves_against_foreground_cwd_then_pane_cwd() {
     for (foreground_cwd, expected_cwd) in [(Some("/repo/task"), "/repo/task"), (None, "/repo")] {
         let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
